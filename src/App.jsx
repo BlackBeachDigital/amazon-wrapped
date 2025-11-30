@@ -26,7 +26,7 @@ try {
 }
 
 const appId = typeof __app_id !== 'undefined' ? __app_id : 'amazon-wrapped';
-const apiKey = ""; // System provides this at runtime
+const apiKey = "AIzaSyBiIg1J-uismJKkc1kZ2neTIqGuwEpC33c"; // System provides this at runtime
 
 // --- ERROR BOUNDARY COMPONENT ---
 class ErrorBoundary extends React.Component {
