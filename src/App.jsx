@@ -26,7 +26,8 @@ try {
 }
 
 const appId = typeof __app_id !== 'undefined' ? __app_id : 'amazon-wrapped';
-const apiKey = "AIzaSyBiIg1J-uismJKkc1kZ2neTIqGuwEpC33c"; // System provides this at runtime
+// IMPORTANT: Ensure this is populated in your deployed code
+const apiKey = "AIzaSyBiIg1J-uismJKkc1kZ2neTIqGuwEpC33c"; 
 
 // --- ERROR BOUNDARY COMPONENT ---
 class ErrorBoundary extends React.Component {
@@ -196,12 +197,10 @@ const generateDemoData = () => {
     { t: "Ceramic Plant Pot", p: 25.00 }
   ];
 
-  // Force a "Funny Pairing" for demo purposes
   const funnyDate = new Date(2025, 4, 20, 23, 30); 
   data.push({ date: funnyDate, orderTimestamp: funnyDate, price: 85.00, title: "Nike Running Shoes", category: "Health", quantity: 1, orderId: "FUNNY-1" });
   data.push({ date: funnyDate, orderTimestamp: funnyDate, price: 5.99, title: "Oreo Double Stuf Chocolate Sandwich Cookies, Family Size", category: "Food", quantity: 1, orderId: "FUNNY-1" });
 
-  // Generate 2025 Data
   for (let i = 0; i < 40; i++) {
     const month = Math.floor(Math.random() * 12);
     const day = Math.floor(Math.random() * 28) + 1;
@@ -225,7 +224,6 @@ const generateDemoData = () => {
     }
   }
 
-  // Generate 2024 Data
   for (let i = 0; i < 30; i++) {
     const month = Math.floor(Math.random() * 12);
     const day = Math.floor(Math.random() * 28) + 1;
@@ -266,25 +264,51 @@ const callGeminiPersona = async (productTitles) => {
     return await fetchGemini(prompt);
 };
 
-const callGeminiPairing = async (groupedPurchases) => {
+// UPDATED: Robust Pairing Logic with Fallback
+const callGeminiPairing = async (groupedPurchases, allTitles) => {
     if (!apiKey) return null; 
-    const textList = Object.entries(groupedPurchases)
+    
+    // Strategy 1: Try to find Same-Day pairs first
+    let textList = Object.entries(groupedPurchases)
         .filter(([date, items]) => items.length > 1)
         .slice(0, 10) 
         .map(([date, items]) => `Date ${date}: ${items.join(', ')}`)
         .join('\n');
 
-    if (!textList) return null;
+    let prompt = "";
 
-    const prompt = `
-      Look at these shopping days. Find the single funniest, most ironic, or oddest pair of items bought on the same day.
-      Example: "Running Shoes" and "Oreos" (Health vs Junk).
-      
-      Data:
-      ${textList}
+    if (textList) {
+        // We found same-day pairings!
+        prompt = `
+          Look at these shopping days. Find the single funniest, most ironic, or oddest pair of items bought on the same day.
+          Example: "Running Shoes" and "Oreos" (Health vs Junk).
+          
+          Data:
+          ${textList}
 
-      Return ONLY a JSON object: { "item1": "Name", "item2": "Name", "comment": "Witty comment about the pair" }. No markdown.
-    `;
+          Return ONLY a JSON object: { "item1": "Name", "item2": "Name", "comment": "Witty comment about the pair" }. No markdown.
+        `;
+    } else {
+        // Strategy 2: Fallback - Pick random items from the year if no same-day pairs exist
+        // This prevents infinite loading
+        const shuffled = allTitles.sort(() => 0.5 - Math.random()).slice(0, 10);
+        const randomPairs = [];
+        for(let i=0; i<shuffled.length - 1; i+=2) {
+            randomPairs.push(`Pair ${i/2+1}: ${shuffled[i]} AND ${shuffled[i+1]}`);
+        }
+        
+        if (randomPairs.length === 0) return null; // No data at all
+
+        prompt = `
+          I have a list of random pairs of items bought by a user this year. Pick the funniest or most contrasting pair.
+          
+          Data:
+          ${randomPairs.join('\n')}
+
+          Return ONLY a JSON object: { "item1": "Name", "item2": "Name", "comment": "Witty comment about these two purchases" }. No markdown.
+        `;
+    }
+
     return await fetchGemini(prompt);
 };
 
@@ -486,8 +510,11 @@ function AmazonWrapped() {
       const titles = stats.data2025.map(i => i.title);
       const personaResult = await callGeminiPersona(titles);
       if (personaResult) setAiAnalysis(personaResult);
-      const pairingResult = await callGeminiPairing(stats.groupedPurchases);
+      
+      // UPDATED: Pass both grouped and flat list to support fallback
+      const pairingResult = await callGeminiPairing(stats.groupedPurchases, titles);
       if (pairingResult) setPairingAnalysis(pairingResult);
+      
       setIsAnalyzing(false);
   };
 
@@ -597,7 +624,8 @@ function AmazonWrapped() {
   };
   const prevSlide = () => setSlideIndex(prev => Math.max(prev - 1, 0));
 
-  // --- Views (MOVED UP TO FIX CRASH) ---
+  // --- Views ---
+
   if (!stats) {
     return (
       <div className="min-h-screen bg-black text-white flex items-center justify-center p-4 font-sans selection:bg-orange-500">
