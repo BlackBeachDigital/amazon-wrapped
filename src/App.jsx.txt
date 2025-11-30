@@ -1,0 +1,1034 @@
+import React, { useState, useMemo, useEffect } from 'react';
+import { Upload, ArrowRight, ArrowLeft, Package, DollarSign, Calendar, TrendingUp, Award, Share2, RefreshCw, HelpCircle, X, ExternalLink, Globe, Lock, Database, Star, Cpu, TrendingDown, Minus, ShoppingCart, MousePointer, Clock, Sun, Moon, Coffee, Scale, Sparkles, Tag, Check } from 'lucide-react';
+import { initializeApp } from "firebase/app";
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "firebase/auth";
+import { getFirestore, collection, addDoc, getDocs, query, where, writeBatch } from "firebase/firestore";
+
+// --- Firebase Setup ---
+const firebaseConfig = {
+  apiKey: "AIzaSyAlTUSnfowRmHb0S2ljrxLkhXqsFjTJuLg",
+  authDomain: "wrapped-ac384.firebaseapp.com",
+  projectId: "wrapped-ac384",
+  storageBucket: "wrapped-ac384.firebasestorage.app",
+  messagingSenderId: "962565111760",
+  appId: "1:962565111760:web:a13881cd25b9010bc203d5",
+  measurementId: "G-EMZXMS4ENC"
+};
+
+// Safe initialization
+let app, auth, db;
+try {
+  app = initializeApp(firebaseConfig);
+  auth = getAuth(app);
+  db = getFirestore(app);
+} catch (e) {
+  console.error("Firebase Initialization Error:", e);
+}
+
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'amazon-wrapped';
+const apiKey = ""; // System provides this at runtime
+
+// --- ERROR BOUNDARY COMPONENT ---
+class ErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { hasError: false, error: null, errorInfo: null };
+  }
+
+  static getDerivedStateFromError(error) {
+    return { hasError: true };
+  }
+
+  componentDidCatch(error, errorInfo) {
+    this.setState({ error, errorInfo });
+    console.error("Uncaught error:", error, errorInfo);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="min-h-screen bg-zinc-900 text-white p-8 flex flex-col items-center justify-center font-mono">
+          <div className="bg-red-900/20 border border-red-500/50 p-6 rounded-xl max-w-2xl w-full">
+            <h1 className="text-xl font-bold text-red-400 mb-4 flex items-center gap-2">
+              <X className="w-6 h-6" /> Something went wrong
+            </h1>
+            <p className="text-sm text-zinc-400 mb-2">Please copy the error below and paste it in the chat:</p>
+            <div className="bg-black/50 p-4 rounded text-xs overflow-auto max-h-64 whitespace-pre-wrap text-red-200">
+              {this.state.error && this.state.error.toString()}
+              <br />
+              {this.state.errorInfo && this.state.errorInfo.componentStack}
+            </div>
+            <button 
+              onClick={() => window.location.reload()}
+              className="mt-6 px-4 py-2 bg-red-600 hover:bg-red-500 rounded text-sm font-bold transition-colors"
+            >
+              Reload Page
+            </button>
+          </div>
+        </div>
+      );
+    }
+
+    return this.props.children; 
+  }
+}
+
+// --- Categorization Logic ---
+const CATEGORIES = {
+  'Tech': ['echo', 'kindle', 'cable', 'battery', 'monitor', 'mouse', 'usb', 'laptop', 'phone', 'headphone', 'ssd', 'drive', 'wifi', 'smart', 'hdmi'],
+  'Home': ['light', 'bulb', 'coffee', 'maker', 'vacuum', 'kitchen', 'pan', 'pot', 'bed', 'sheet', 'towel', 'decor', 'shelf', 'toothbrush', 'bamboo'],
+  'Health': ['protein', 'vitamin', 'supplement', 'mask', 'fitness', 'weight', 'yoga', 'brush', 'paste', 'lube', 'wellness'],
+  'Pet': ['cat', 'dog', 'food', 'toy', 'litter', 'treat'],
+  'Books': ['book', 'paperback', 'hardcover', 'novel', 'guide'],
+  'Food': ['taco', 'shells', 'sauce', 'snack', 'candy', 'grocery', 'pasta', 'beans', 'rice', 'oil'],
+  'Gardening': ['garden', 'seed', 'plant', 'pot', 'hose', 'shovel', 'rake', 'soil', 'grow']
+};
+
+const categorizeItem = (title) => {
+  const t = title.toLowerCase();
+  for (const [cat, keywords] of Object.entries(CATEGORIES)) {
+    if (keywords.some(k => t.includes(k))) return cat;
+  }
+  return 'Misc';
+};
+
+// --- Helper Functions ---
+
+const parseCSV = (text) => {
+  if (!text) return null;
+  const lines = text.split('\n').filter(l => l.trim());
+  if (lines.length < 2) return null;
+  
+  const headers = lines[0].split(',').map(h => h.replace(/"/g, '').trim().toLowerCase());
+  
+  const PII_IGNORES = [
+    'shipping address', 'billing address', 'address', 
+    'recipient', 'sender', 'gift message', 'contact',
+    'payment instrument', 'credit card', 'account',
+    'website', 'ip address',
+    'purchase order', 'serial', 'tracking', 'shipment id',
+    'condition', 'status', 'carrier', 'service'
+  ];
+
+  const MONEY_IGNORES = [...PII_IGNORES, 'tax', 'shipping', 'subtotal', 'discount', 'fee', 'order id'];
+  
+  const findCol = (exactMatches, fallbackKeywords, ignoreList = []) => {
+    for (const opt of exactMatches) {
+      const idx = headers.indexOf(opt);
+      if (idx !== -1) return idx;
+    }
+    return headers.findIndex(h => {
+        if (ignoreList.some(ignored => h.includes(ignored))) return false;
+        return fallbackKeywords.some(k => h.includes(k));
+    });
+  };
+
+  const shipDateIdx = findCol(['ship date', 'shipdate'], ['ship'], PII_IGNORES); 
+  const orderDateIdx = findCol(['order date', 'orderdate'], ['date'], PII_IGNORES); 
+  
+  const totalIdx = findCol(['total owed', 'total charged', 'order total'], ['total', 'price', 'amount', 'grand total'], MONEY_IGNORES);
+  const titleIdx = findCol(['product name', 'item name', 'title'], ['title', 'item', 'desc', 'product'], PII_IGNORES);
+  const orderIdIdx = findCol(['order id'], ['order id', 'orderid'], []); 
+  const qtyIdx = findCol(['quantity', 'qty'], ['quantity', 'qty'], []); 
+
+  if ((shipDateIdx === -1 && orderDateIdx === -1) || totalIdx === -1) return null;
+
+  return lines.slice(1).map(line => {
+    const regex = /,(?=(?:(?:[^"]*"){2})*[^"]*$)/;
+    const values = line.split(regex).map(v => v.replace(/"/g, '').trim());
+    
+    if (values.length < headers.length) return null;
+
+    const rawPrice = values[totalIdx];
+    const price = rawPrice ? parseFloat(rawPrice.replace(/[^0-9.]/g, '')) : 0;
+    const title = values[titleIdx] || "Unknown Item";
+    
+    const mainDateStr = shipDateIdx !== -1 ? values[shipDateIdx] : values[orderDateIdx];
+    const date = new Date(mainDateStr);
+
+    const orderDateStr = orderDateIdx !== -1 ? values[orderDateIdx] : mainDateStr;
+    const orderDate = new Date(orderDateStr);
+    
+    const rawQty = qtyIdx !== -1 ? values[qtyIdx] : "1";
+    const quantity = parseInt(rawQty.replace(/[^0-9]/g, '')) || 1;
+
+    const orderId = orderIdIdx !== -1 ? values[orderIdIdx] : Math.random().toString(36);
+
+    return {
+      date: date, 
+      orderTimestamp: orderDate,
+      price: isNaN(price) ? 0 : price,
+      title: title,
+      category: categorizeItem(title),
+      quantity: quantity,
+      orderId: orderId
+    };
+  }).filter(item => {
+      const year = item && !isNaN(item.date.getTime()) ? item.date.getFullYear() : 0;
+      const validTime = item && !isNaN(item.orderTimestamp.getTime());
+      
+      return item && 
+             item.price > 0 && 
+             validTime &&
+             (year === 2024 || year === 2025);
+  });
+};
+
+const generateDemoData = () => {
+  const data = [];
+  const items = [
+    { t: "NUDUKO Biodegradable Bamboo Toothbrushes, 10 Piece", p: 7.36 }, 
+    { t: "Old El Paso Stand 'N Stuff Taco Shells, 4.7 Oz", p: 1.73 },
+    { t: "Old El Paso Taco Seasoning Mix, Original, 1 oz", p: 0.99 },
+    { t: "Recycled Paper Towels, 6 Rolls", p: 18.50 },
+    { t: "Dr. Bronner's Pure-Castile Liquid Soap - Peppermint", p: 15.99 },
+    { t: "Organic Quinoa, 4lb Bag", p: 12.49 },
+    { t: "Reusable Silicone Food Storage Bags", p: 22.99 },
+    { t: "Mason Jars 16oz, 12 Pack", p: 28.00 },
+    { t: "Echo Dot (5th Gen)", p: 49.99 }, 
+    { t: "Kindle Paperwhite", p: 139.99 },
+    { t: "50-Pack AA Batteries", p: 15.99 }, 
+    { t: "HDMI Cable 6ft", p: 8.99 }, 
+    { t: "Wireless Mouse", p: 25.00 },
+    { t: "Smart Light Bulb", p: 12.99 }, 
+    { t: "Running Shoes", p: 85.00 },
+    { t: "USB-C Hub", p: 35.00 },
+    { t: "Ceramic Plant Pot", p: 25.00 }
+  ];
+
+  // Force a "Funny Pairing" for demo purposes
+  const funnyDate = new Date(2025, 4, 20, 23, 30); 
+  data.push({ date: funnyDate, orderTimestamp: funnyDate, price: 85.00, title: "Nike Running Shoes", category: "Health", quantity: 1, orderId: "FUNNY-1" });
+  data.push({ date: funnyDate, orderTimestamp: funnyDate, price: 5.99, title: "Oreo Double Stuf Chocolate Sandwich Cookies, Family Size", category: "Food", quantity: 1, orderId: "FUNNY-1" });
+
+  // Generate 2025 Data
+  for (let i = 0; i < 40; i++) {
+    const month = Math.floor(Math.random() * 12);
+    const day = Math.floor(Math.random() * 28) + 1;
+    const hour = Math.random() > 0.6 ? Math.floor(Math.random() * 4) + 22 : Math.floor(Math.random() * 24);
+    
+    const date = new Date(2025, month, day, hour, Math.floor(Math.random()*60));
+    const orderId = `111-${Math.floor(Math.random()*1000000)}-${Math.floor(Math.random()*1000000)}`;
+    const itemsInOrder = Math.floor(Math.random() * 3) + 1;
+    
+    for (let j = 0; j < itemsInOrder; j++) {
+        const item = items[Math.floor(Math.random() * items.length)];
+        data.push({
+          date: date,
+          orderTimestamp: date,
+          price: item.p,
+          title: item.t,
+          category: categorizeItem(item.t),
+          quantity: 1,
+          orderId: orderId
+        });
+    }
+  }
+
+  // Generate 2024 Data
+  for (let i = 0; i < 30; i++) {
+    const month = Math.floor(Math.random() * 12);
+    const day = Math.floor(Math.random() * 28) + 1;
+    const hour = Math.floor(Math.random() * 24);
+    const date = new Date(2024, month, day, hour, 30);
+    const orderId = `111-${Math.floor(Math.random()*1000000)}-${Math.floor(Math.random()*1000000)}`;
+    const itemsInOrder = Math.floor(Math.random() * 2) + 1;
+
+    for (let j = 0; j < itemsInOrder; j++) {
+        const oldItems = items.slice(5); 
+        const item = oldItems[Math.floor(Math.random() * oldItems.length)];
+        data.push({
+          date: date,
+          orderTimestamp: date,
+          price: item.p,
+          title: item.t,
+          category: categorizeItem(item.t),
+          quantity: 1,
+          orderId: orderId
+        });
+    }
+  }
+
+  return data;
+};
+
+// --- AI Functions ---
+
+const callGeminiPersona = async (productTitles) => {
+    if (!apiKey) return null; 
+    const uniqueTitles = [...new Set(productTitles)].slice(0, 50);
+    const prompt = `
+      Analyze this list of Amazon purchases: ${JSON.stringify(uniqueTitles)}. 
+      1. Give this person a creative "Persona Name" (e.g. 'The Tech Bro', 'The Eco-Warrior', 'The Late Night Snacker'). 
+      2. Write a short, funny, 2-sentence "Roast" or "Vibe Check".
+      3. Return ONLY a JSON object: { "persona": "Name", "roast": "Roast text" }. No markdown.
+    `;
+    return await fetchGemini(prompt);
+};
+
+const callGeminiPairing = async (groupedPurchases) => {
+    if (!apiKey) return null; 
+    const textList = Object.entries(groupedPurchases)
+        .filter(([date, items]) => items.length > 1)
+        .slice(0, 10) 
+        .map(([date, items]) => `Date ${date}: ${items.join(', ')}`)
+        .join('\n');
+
+    if (!textList) return null;
+
+    const prompt = `
+      Look at these shopping days. Find the single funniest, most ironic, or oddest pair of items bought on the same day.
+      Example: "Running Shoes" and "Oreos" (Health vs Junk).
+      
+      Data:
+      ${textList}
+
+      Return ONLY a JSON object: { "item1": "Name", "item2": "Name", "comment": "Witty comment about the pair" }. No markdown.
+    `;
+    return await fetchGemini(prompt);
+};
+
+const fetchGemini = async (prompt) => {
+    try {
+        const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
+        });
+
+        if (!response.ok) throw new Error('Gemini API Error');
+        const result = await response.json();
+        const text = result.candidates?.[0]?.content?.parts?.[0]?.text;
+        const cleanText = text.replace(/```json/g, '').replace(/```/g, '').trim();
+        return JSON.parse(cleanText);
+    } catch (error) {
+        console.error("AI Error:", error);
+        return null; 
+    }
+};
+
+// --- Components ---
+
+const Slide = ({ children, bgClass = "bg-zinc-900", onNext, onPrev, showNav = true }) => (
+  <div className={`w-full h-full absolute inset-0 flex flex-col items-center justify-center p-6 text-center transition-all duration-500 ${bgClass}`}>
+    <div className="flex-1 flex flex-col items-center justify-center w-full max-w-md animate-fadeIn">
+      {children}
+    </div>
+    {showNav && (
+      <div className="w-full max-w-md flex justify-between items-center mt-8 px-4 z-20">
+        <button onClick={onPrev} className="p-3 rounded-full bg-white/10 hover:bg-white/20 text-white backdrop-blur-sm transition">
+          <ArrowLeft size={24} />
+        </button>
+        <button onClick={onNext} className="p-3 rounded-full bg-white/10 hover:bg-white/20 text-white backdrop-blur-sm transition">
+          <ArrowRight size={24} />
+        </button>
+      </div>
+    )}
+  </div>
+);
+
+const StatCard = ({ label, value, subtext, icon: Icon, delay = 0 }) => (
+  <div 
+    className="bg-white/10 backdrop-blur-md border border-white/10 p-6 rounded-2xl w-full mb-4 transform transition-all hover:scale-105"
+    style={{ animation: `slideUp 0.6s ease-out ${delay}s backwards` }}
+  >
+    {Icon && <Icon className="w-8 h-8 mb-3 text-orange-400 mx-auto" />}
+    <div className="text-zinc-400 text-sm uppercase tracking-wider font-semibold mb-1">{label}</div>
+    <div className="text-4xl font-black text-white mb-2">{value}</div>
+    {subtext && <div className="text-zinc-400 text-sm">{subtext}</div>}
+  </div>
+);
+
+const ProgressBar = ({ current, total }) => (
+  <div className="absolute top-4 left-0 w-full px-4 flex gap-1 z-50">
+    {Array.from({ length: total }).map((_, i) => (
+      <div key={i} className="h-1 flex-1 rounded-full bg-white/20 overflow-hidden">
+        <div 
+          className={`h-full bg-white transition-all duration-300 ${i === current ? 'w-full' : i < current ? 'w-full' : 'w-0'}`}
+        />
+      </div>
+    ))}
+  </div>
+);
+
+function AmazonWrapped() {
+  const [data, setData] = useState(null);
+  const [slideIndex, setSlideIndex] = useState(0);
+  const [error, setError] = useState(null);
+  const [showInstructions, setShowInstructions] = useState(false);
+  const [user, setUser] = useState(null);
+  const [hasSubmitted, setHasSubmitted] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [seeding, setSeeding] = useState(false);
+  const [authError, setAuthError] = useState(false);
+  
+  // AI State
+  const [aiAnalysis, setAiAnalysis] = useState(null);
+  const [pairingAnalysis, setPairingAnalysis] = useState(null);
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
+
+  // --- Auth & Data Effects ---
+  useEffect(() => {
+    if (!auth) {
+      setAuthError(true);
+      return;
+    }
+    const initAuth = async () => {
+      try {
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+          await signInWithCustomToken(auth, __initial_auth_token);
+        } else {
+           throw new Error("No custom token available");
+        }
+      } catch (err) {
+        console.log("Custom token auth failed, falling back to anonymous.");
+        try {
+            await signInAnonymously(auth);
+        } catch (anonErr) {
+            console.error("Anonymous auth failed:", anonErr);
+            setAuthError(true);
+        }
+      }
+    };
+    initAuth();
+    const unsubscribe = onAuthStateChanged(auth, setUser);
+    return () => unsubscribe();
+  }, []);
+
+  // --- Statistics Calculation ---
+  const stats = useMemo(() => {
+    if (!data || data.length === 0) return null;
+
+    const data2025 = data.filter(d => d.date.getFullYear() === 2025);
+    const data2024 = data.filter(d => d.date.getFullYear() === 2024);
+
+    const totalSpent = data2025.reduce((sum, item) => sum + item.price, 0);
+    const uniqueOrders = new Set(data2025.map(item => item.orderId));
+    const totalOrders = uniqueOrders.size;
+    const totalItems = data2025.reduce((sum, item) => sum + item.quantity, 0);
+    
+    const mostExpensive = data2025.reduce((max, item) => item.price > max.price ? item : max, data2025[0] || { price: 0, title: "None" });
+    const cheapest = data2025.reduce((min, item) => (item.price < min.price && item.price > 0) ? item : min, data2025[0] || { price: 0, title: "None" });
+
+    const spent2024 = data2024.reduce((sum, item) => sum + item.price, 0);
+    const orders2024 = new Set(data2024.map(item => item.orderId)).size;
+    const spendDiff = totalSpent - spent2024;
+    const orderDiff = totalOrders - orders2024;
+    
+    const titles2024 = new Set(data2024.map(i => i.title.toLowerCase()));
+    const newItems = data2025.filter(i => !titles2024.has(i.title.toLowerCase()));
+    const discovery = newItems.length > 0 ? newItems[Math.floor(Math.random() * newItems.length)] : null;
+
+    const monthCounts = new Array(12).fill(0);
+    data2025.forEach(item => monthCounts[item.date.getMonth()]++);
+    const busiestMonthIdx = monthCounts.indexOf(Math.max(...monthCounts));
+    const monthNames = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+    const catCounts = {};
+    data2025.forEach(item => { catCounts[item.category] = (catCounts[item.category] || 0) + 1; });
+    const topCategory = Object.entries(catCounts).sort((a,b) => b[1] - a[1])[0] || ['None', 0];
+
+    const timeBuckets = { morning: 0, lunch: 0, afternoon: 0, evening: 0, latenight: 0 };
+    const purchasesByDay = {};
+
+    data2025.forEach(item => {
+        if (!isNaN(item.orderTimestamp.getTime())) {
+            const h = item.orderTimestamp.getHours();
+            if (h >= 5 && h < 12) timeBuckets.morning++;
+            else if (h >= 12 && h < 14) timeBuckets.lunch++;
+            else if (h >= 14 && h < 18) timeBuckets.afternoon++;
+            else if (h >= 18 && h < 22) timeBuckets.evening++;
+            else timeBuckets.latenight++;
+        }
+        const dateKey = item.date.toDateString();
+        if (!purchasesByDay[dateKey]) purchasesByDay[dateKey] = [];
+        purchasesByDay[dateKey].push(item.title);
+    });
+
+    const maxBucketKey = Object.keys(timeBuckets).reduce((a, b) => timeBuckets[a] > timeBuckets[b] ? a : b);
+    
+    let timePersona = "The Mystery Shopper";
+    let timeDescription = "You shop whenever, wherever.";
+    let timeIcon = Clock;
+    let timeRange = "";
+
+    switch(maxBucketKey) {
+        case 'morning': timePersona = "The Early Bird"; timeDescription = "You get your shopping done before the world wakes up."; timeIcon = Sun; timeRange = "5AM - 12PM"; break;
+        case 'lunch': timePersona = "The Lunch Break Shopper"; timeDescription = "Multitasking at its finest."; timeIcon = Coffee; timeRange = "12PM - 2PM"; break;
+        case 'afternoon': timePersona = "The Daydreamer"; timeDescription = "Beating the afternoon slump with a little retail therapy."; timeIcon = Sun; timeRange = "2PM - 6PM"; break;
+        case 'evening': timePersona = "The Relaxed Browser"; timeDescription = "Decompressing after work by scrolling through deals."; timeIcon = Moon; timeRange = "6PM - 10PM"; break;
+        case 'latenight': timePersona = "The Midnight Scroller"; timeDescription = "Most of your orders happen when you should probably be sleeping."; timeIcon = Moon; timeRange = "10PM - 5AM"; break;
+    }
+
+    return {
+      data2025,
+      totalSpent,
+      totalOrders,
+      totalItems,
+      mostExpensive,
+      cheapest, 
+      busiestMonth: { name: monthNames[busiestMonthIdx], count: monthCounts[busiestMonthIdx] },
+      monthlyData: monthCounts,
+      avgOrder: totalOrders > 0 ? totalSpent / totalOrders : 0,
+      itemsPerOrder: totalOrders > 0 ? (totalItems / totalOrders).toFixed(1) : 0,
+      topCategory: { name: topCategory[0], count: topCategory[1] },
+      comparison: { spentDiff: spendDiff, orderDiff: orderDiff, discovery: discovery },
+      timeStats: { persona: timePersona, description: timeDescription, icon: timeIcon, range: timeRange, buckets: timeBuckets, max: Math.max(...Object.values(timeBuckets)) },
+      groupedPurchases: purchasesByDay
+    };
+  }, [data]);
+
+  // --- Trigger AI Analysis ---
+  const triggerAI = async () => {
+      if (!apiKey) return; 
+      if (!stats || !stats.data2025 || isAnalyzing || aiAnalysis) return;
+      setIsAnalyzing(true);
+      const titles = stats.data2025.map(i => i.title);
+      const personaResult = await callGeminiPersona(titles);
+      if (personaResult) setAiAnalysis(personaResult);
+      const pairingResult = await callGeminiPairing(stats.groupedPurchases);
+      if (pairingResult) setPairingAnalysis(pairingResult);
+      setIsAnalyzing(false);
+  };
+
+  const seedDatabase = async () => {
+    if (!user || seeding) return;
+    setSeeding(true);
+    try {
+      const collectionRef = collection(db, 'artifacts', appId, 'public', 'data', 'wrapped_stats');
+      const categories = ['Tech', 'Home', 'Health', 'Pet', 'Books', 'Gardening'];
+      const promises = [];
+      for (let i=0; i<50; i++) {
+        const u = 1 - Math.random(); 
+        const v = Math.random();
+        const z = Math.sqrt( -2.0 * Math.log( u ) ) * Math.cos( 2.0 * Math.PI * v );
+        let spend = 1200 + z * 600;
+        if (spend < 50) spend = 50; 
+        let orders = Math.floor(spend / 25); 
+        promises.push(addDoc(collectionRef, {
+           totalSpent: Math.floor(spend),
+           totalOrders: orders,
+           topCategory: categories[Math.floor(Math.random() * categories.length)],
+           timestamp: new Date().toISOString(),
+           isSeed: true
+        }));
+      }
+      await Promise.all(promises);
+      setSeeding(false);
+      alert("Database seeded!");
+    } catch (err) {
+      console.error("Seeding error", err);
+      alert("Error seeding data");
+    }
+  };
+
+  // --- CONTRIBUTING LOGIC (Write Only) ---
+  const handleContribute = async () => {
+    if (!user) {
+        setError("Database connection missing. Did you enable Anonymous Auth in Firebase?");
+        return;
+    }
+    if (!stats || isSubmitting) return;
+    
+    // Capture values for upload
+    const currentTotalSpent = stats.totalSpent;
+    const currentTopCategory = stats.topCategory.name;
+    const currentTotalOrders = stats.totalOrders;
+
+    setIsSubmitting(true);
+    try {
+      const statPayload = {
+        totalSpent: currentTotalSpent,
+        totalOrders: currentTotalOrders,
+        topCategory: currentTopCategory,
+        timestamp: new Date().toISOString()
+      };
+      
+      // Write to Firestore
+      await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'wrapped_stats'), statPayload);
+      
+      // Set submitted state to change UI
+      setHasSubmitted(true);
+      
+    } catch (err) {
+      console.error("Submission error:", err);
+      setError("Failed to upload stats: " + err.message);
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const handleFileUpload = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      const parsed = parseCSV(event.target.result);
+      if (parsed && parsed.length > 0) {
+        setData(parsed);
+        setError(null);
+        setSlideIndex(0);
+        setComparisonData(null);
+        setAiAnalysis(null);
+        setPairingAnalysis(null);
+        setHasSubmitted(false);
+      } else {
+        setError("Could not parse CSV. Make sure it's a standard Amazon Order History report.");
+      }
+    };
+    reader.readAsText(file);
+  };
+
+  const loadDemo = () => {
+    setData(generateDemoData());
+    setError(null);
+    setSlideIndex(0);
+    setComparisonData(null);
+    setAiAnalysis(null);
+    setPairingAnalysis(null);
+    setHasSubmitted(false);
+  };
+
+  const nextSlide = () => {
+      if ((slideIndex === 0 || slideIndex === 1) && !aiAnalysis && !isAnalyzing) {
+          triggerAI();
+      }
+      setSlideIndex(prev => Math.min(prev + 1, 10)); 
+  };
+  const prevSlide = () => setSlideIndex(prev => Math.max(prev - 1, 0));
+
+  // --- Views (MOVED UP TO FIX CRASH) ---
+  if (!stats) {
+    return (
+      <div className="min-h-screen bg-black text-white flex items-center justify-center p-4 font-sans selection:bg-orange-500">
+        <div className="max-w-xl w-full text-center space-y-8">
+          <div className="space-y-4">
+            <h1 className="text-6xl font-black bg-gradient-to-r from-orange-400 to-yellow-400 bg-clip-text text-transparent">
+              Amazon<br/>Wrapped
+            </h1>
+            <p className="text-zinc-400 text-lg">
+              Review your 2025 spending habits in style. <br/>
+              <span className="text-xs opacity-50">(Data stays in your browser until you choose to compare.)</span>
+            </p>
+          </div>
+
+          <div className="border-2 border-dashed border-zinc-700 rounded-xl p-10 hover:border-orange-500 transition-colors group cursor-pointer relative">
+             <input 
+              type="file" 
+              accept=".csv"
+              onChange={handleFileUpload}
+              className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
+            />
+            <Upload className="w-12 h-12 mx-auto text-zinc-500 group-hover:text-orange-400 mb-4 transition-colors" />
+            <h3 className="text-xl font-bold mb-2">Upload Order History CSV</h3>
+            <p className="text-sm text-zinc-500">Drag & drop or click to select</p>
+          </div>
+
+          {error && <div className="bg-red-500/20 text-red-400 p-3 rounded-lg text-sm">{error}</div>}
+          
+          {authError && <div className="bg-orange-500/20 text-orange-400 p-3 rounded-lg text-xs">
+             Warning: Database connection failed. You can still view your local stats, but "Community Comparison" will be disabled. 
+             (Check Firebase Console &gt; Authentication &gt; Sign-in method &gt; Anonymous).
+          </div>}
+
+          <button
+            onClick={() => setShowInstructions(true)}
+            className="mt-6 text-[#FF9900] hover:text-[#FFB84D] font-bold text-lg transition-all flex items-center justify-center gap-2 mx-auto animate-pulse-gold"
+          >
+            <HelpCircle size={20} />
+            How do I get my Order History CSV from Amazon?
+          </button>
+          
+          {user && (
+            <div className="flex justify-center mt-4 opacity-30 hover:opacity-100 transition-opacity">
+                <button 
+                    onClick={seedDatabase} 
+                    disabled={seeding}
+                    className="text-xs text-zinc-500 hover:text-white flex gap-1 items-center border border-zinc-800 px-3 py-1 rounded-full"
+                >
+                    <Database size={10} />
+                    {seeding ? "Seeding..." : "Seed Database (Admin)"}
+                </button>
+            </div>
+          )}
+
+          <div className="relative">
+            <div className="absolute inset-0 flex items-center">
+              <div className="w-full border-t border-zinc-800"></div>
+            </div>
+            <div className="relative flex justify-center text-sm">
+              <span className="px-2 bg-black text-zinc-500">Or just curious?</span>
+            </div>
+          </div>
+
+          <button 
+            onClick={loadDemo}
+            className="w-full py-4 bg-zinc-800 hover:bg-zinc-700 rounded-xl font-bold transition-all flex items-center justify-center gap-2"
+          >
+            <RefreshCw size={18} />
+            Try with Demo Data
+          </button>
+        </div>
+
+        {showInstructions && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-fadeIn">
+            <div className="bg-zinc-900 border border-zinc-700 p-8 rounded-2xl max-w-lg w-full relative shadow-2xl">
+              <button 
+                onClick={() => setShowInstructions(false)}
+                className="absolute top-4 right-4 text-zinc-500 hover:text-white transition-colors"
+              >
+                <X size={24} />
+              </button>
+              <h2 className="text-2xl font-bold mb-6 text-white">How to get your data</h2>
+              <ol className="space-y-4 text-zinc-300 list-decimal pl-5 text-sm md:text-base">
+                <li className="pl-2">Go to Amazon's <a href="https://www.amazon.com/hz/privacy-central/data-requests/preview.html" target="_blank" rel="noreferrer" className="text-orange-400 hover:underline inline-flex items-center gap-1 font-semibold">Request My Data <ExternalLink size={14}/></a> page.</li>
+                <li className="pl-2">In the dropdown menu labeled <strong>"Select Data Category"</strong>, choose <strong>"Your Orders"</strong>.</li>
+                <li className="pl-2">Click <strong>"Submit Request"</strong>. You may need to click a link in your email to confirm the request.</li>
+                <li className="pl-2">Wait for the "Your Data Is Ready" email. <span className="text-zinc-500 text-xs block mt-1">(This usually takes a few hours, but can take longer.)</span></li>
+                <li className="pl-2">Download the zip file, unzip it, and find the file usually named like <code>Retail.OrderHistory.1.csv</code>. Upload that file here.</li>
+              </ol>
+              <button onClick={() => setShowInstructions(false)} className="w-full mt-8 py-3 bg-white text-black font-bold rounded-lg hover:bg-zinc-200 transition-colors">Got it</button>
+            </div>
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  // --- Slides Content Definition ---
+  const slides = [
+    // Slide 0: Intro
+    <Slide key="0" bgClass="bg-zinc-950" onNext={nextSlide} onPrev={prevSlide}>
+      <h2 className="text-5xl font-black mb-6 leading-tight">
+        You really liked<br/>
+        <span className="text-orange-500">brown boxes</span><br/>
+        this year.
+      </h2>
+      <p className="text-xl text-zinc-400">Let's see the damage.</p>
+    </Slide>,
+
+    // Slide 1: The Big Number
+    <Slide key="1" bgClass="bg-gradient-to-b from-orange-900 to-black" onNext={nextSlide} onPrev={prevSlide}>
+      <StatCard 
+        label="Total Spent in 2025" 
+        value={`$${stats.totalSpent.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}`} 
+        icon={DollarSign}
+        subtext={`That's about $${stats.avgOrder.toFixed(0)} per order.`}
+      />
+      <div className="mt-8 text-zinc-400 text-lg max-w-xs mx-auto">
+        If you had invested that in the S&P 500 instead, it would be worth approximately... <span className="text-white font-bold">${(stats.totalSpent * 1.155).toFixed(2)}</span> today.
+      </div>
+    </Slide>,
+
+    // Slide 2: Order Volume
+    <Slide key="2" bgClass="bg-gradient-to-br from-purple-900 to-black" onNext={nextSlide} onPrev={prevSlide}>
+      <StatCard 
+        label="Total Orders" 
+        value={stats.totalOrders} 
+        icon={Package}
+        delay={0.1}
+      />
+      <div className="w-full h-48 flex items-end justify-between gap-1 mt-8 px-2">
+        {stats.monthlyData.map((count, i) => (
+          <div key={i} className="flex-1 flex flex-col justify-end group relative">
+             <div 
+              className="w-full bg-purple-500 rounded-t-sm transition-all duration-1000 hover:bg-purple-400"
+              style={{ height: `${(count / Math.max(...stats.monthlyData)) * 100}%` }}
+             >
+               {count > 0 && (
+                 <div className="absolute -top-8 left-1/2 -translate-x-1/2 bg-white text-black text-xs font-bold px-1 rounded opacity-0 group-hover:opacity-100">
+                   {count}
+                 </div>
+               )}
+             </div>
+             <div className="text-[10px] text-zinc-500 text-center mt-1 font-mono uppercase">
+               {['J','F','M','A','M','J','J','A','S','O','N','D'][i]}
+             </div>
+          </div>
+        ))}
+      </div>
+    </Slide>,
+
+    // Slide 3: Efficiency Score
+    <Slide key="3" bgClass="bg-zinc-900" onNext={nextSlide} onPrev={prevSlide}>
+        <div className="text-center w-full max-w-md">
+            <h2 className="text-2xl font-bold text-zinc-400 uppercase tracking-widest mb-8">Cart Efficiency</h2>
+            <div className="bg-gradient-to-r from-blue-900 to-blue-800 p-8 rounded-3xl shadow-xl mb-6 border border-blue-700/50">
+                <div className="flex items-center justify-center gap-2 mb-2">
+                    <ShoppingCart className="text-blue-300" size={24} />
+                    <span className="text-blue-200 font-bold">vs</span>
+                    <MousePointer className="text-blue-300" size={24} />
+                </div>
+                <div className="text-5xl font-black text-white mb-2">{stats.itemsPerOrder}</div>
+                <div className="text-blue-200 font-medium text-lg">items per "Buy Now"</div>
+            </div>
+            <div className="grid grid-cols-2 gap-4 text-left">
+                <div className="bg-zinc-800 p-4 rounded-xl border border-zinc-700">
+                    <div className="text-zinc-500 text-xs uppercase mb-1">Total Items</div>
+                    <div className="text-xl font-bold text-white">{stats.totalItems}</div>
+                </div>
+                <div className="bg-zinc-800 p-4 rounded-xl border border-zinc-700">
+                    <div className="text-zinc-500 text-xs uppercase mb-1">Unique Orders</div>
+                    <div className="text-xl font-bold text-white">{stats.totalOrders}</div>
+                </div>
+            </div>
+            <p className="mt-6 text-zinc-500 text-sm">
+                {stats.itemsPerOrder > 2 
+                    ? "You're an efficiency pro! You bundle up." 
+                    : "You love that 'Buy Now' button a little too much."}
+            </p>
+        </div>
+    </Slide>,
+
+    // Slide 4: NEW - Time of Day Persona
+    <Slide key="4" bgClass="bg-gradient-to-b from-indigo-950 to-black" onNext={nextSlide} onPrev={prevSlide}>
+        <div className="text-center w-full max-w-md px-4">
+            <stats.timeStats.icon className="w-16 h-16 text-indigo-400 mx-auto mb-6 animate-pulse" />
+            <h2 className="text-zinc-400 text-sm font-bold uppercase tracking-widest mb-2">Your Shopping Clock</h2>
+            <h1 className="text-4xl font-black text-white mb-4 leading-tight">{stats.timeStats.persona}</h1>
+            <p className="text-indigo-200 text-lg mb-8">{stats.timeStats.description}</p>
+            
+            {/* Simple Bar Chart for Time Buckets */}
+            <div className="flex items-end justify-between h-32 gap-2 mb-4">
+                {Object.entries(stats.timeStats.buckets).map(([key, count]) => (
+                    <div key={key} className="flex-1 flex flex-col justify-end items-center group">
+                        <div 
+                            className={`w-full rounded-t-md transition-all duration-1000 ${key === 'latenight' || key === 'evening' ? 'bg-indigo-500' : 'bg-zinc-700'}`}
+                            style={{ height: `${stats.timeStats.max > 0 ? (count / stats.timeStats.max) * 100 : 0}%` }}
+                        />
+                        <span className="text-[10px] text-zinc-500 uppercase mt-2 font-bold">{key.substr(0,3)}</span>
+                    </div>
+                ))}
+            </div>
+            <div className="bg-white/5 p-3 rounded-lg text-xs text-zinc-400">
+                Most active between <span className="text-white font-bold">{stats.timeStats.range}</span>
+            </div>
+        </div>
+    </Slide>,
+
+    // Slide 5: Year over Year Comparison
+    <Slide key="5" bgClass="bg-gradient-to-br from-green-900 to-black" onNext={nextSlide} onPrev={prevSlide}>
+        <div className="text-center w-full max-w-md">
+            <h2 className="text-2xl font-bold text-zinc-400 uppercase tracking-widest mb-8">vs 2024</h2>
+            <div className="grid grid-cols-2 gap-4 mb-8">
+                <div className="bg-white/10 backdrop-blur p-4 rounded-xl">
+                    <div className="text-zinc-400 text-xs uppercase mb-1">Spend Difference</div>
+                    <div className={`text-2xl font-black ${stats.comparison.spentDiff >= 0 ? 'text-green-400' : 'text-red-400'} flex items-center justify-center gap-1`}>
+                        {stats.comparison.spentDiff >= 0 ? <TrendingUp size={20}/> : <TrendingDown size={20}/>}
+                        ${Math.abs(stats.comparison.spentDiff).toFixed(0)}
+                    </div>
+                    <div className="text-xs text-zinc-500 mt-1">{stats.comparison.spentDiff >= 0 ? 'more' : 'less'} than last year</div>
+                </div>
+                <div className="bg-white/10 backdrop-blur p-4 rounded-xl">
+                    <div className="text-zinc-400 text-xs uppercase mb-1">Order Difference</div>
+                    <div className={`text-2xl font-black ${stats.comparison.orderDiff >= 0 ? 'text-green-400' : 'text-red-400'} flex items-center justify-center gap-1`}>
+                        {stats.comparison.orderDiff >= 0 ? <Package size={20}/> : <Minus size={20}/>}
+                        {Math.abs(stats.comparison.orderDiff)}
+                    </div>
+                    <div className="text-xs text-zinc-500 mt-1">{stats.comparison.orderDiff >= 0 ? 'more' : 'less'} orders</div>
+                </div>
+            </div>
+            {stats.comparison.discovery && (
+                <div className="bg-zinc-800/80 p-6 rounded-2xl border border-zinc-700 animate-slideUp">
+                    <div className="flex items-center justify-center gap-2 text-yellow-400 font-bold mb-3">
+                        <Star size={16} /> New Discovery
+                    </div>
+                    <p className="text-zinc-400 text-sm mb-2">In 2025, you ordered this for the first time ever:</p>
+                    <div className="text-white font-bold text-lg line-clamp-2 leading-snug">
+                        "{stats.comparison.discovery.title}"
+                    </div>
+                </div>
+            )}
+        </div>
+    </Slide>,
+
+    // Slide 6: Categories
+    <Slide key="6" bgClass="bg-zinc-900" onNext={nextSlide} onPrev={prevSlide}>
+      <h2 className="text-3xl font-black mb-8 text-white">Your Vibe</h2>
+      <div className="grid grid-cols-2 gap-4 w-full max-w-md">
+        <div className="bg-zinc-800 p-6 rounded-2xl col-span-2 border border-zinc-700">
+           <div className="text-zinc-500 text-sm uppercase font-bold mb-2">Top Category</div>
+           <div className="text-4xl font-black text-orange-400">{stats.topCategory.name}</div>
+           <div className="text-white mt-1">{stats.topCategory.count} items</div>
+        </div>
+      </div>
+      <p className="mt-8 text-zinc-400 max-w-xs">
+         We detected a lot of <strong>{stats.topCategory.name}</strong> related items. 
+         {stats.topCategory.name === 'Gardening' && " Your garden must look amazing."}
+         {stats.topCategory.name === 'Tech' && " Building a battlestation?"}
+      </p>
+    </Slide>,
+
+    // Slide 7: AI Analysis (Persona)
+    <Slide key="7" bgClass="bg-gradient-to-tr from-purple-800 to-indigo-900" onNext={nextSlide} onPrev={prevSlide}>
+      <Star className="w-16 h-16 text-yellow-300 mx-auto mb-6 animate-pulse" />
+      <h2 className="text-3xl font-black mb-4 text-white">AI Vibe Check</h2>
+      {aiAnalysis ? (
+          <div className="animate-fadeIn w-full max-w-md bg-white/10 backdrop-blur-md p-8 rounded-2xl border border-white/20 shadow-2xl">
+              <div className="text-zinc-400 text-sm font-bold uppercase tracking-wider mb-2">Your Persona</div>
+              <div className="text-4xl font-black text-transparent bg-clip-text bg-gradient-to-r from-yellow-300 to-pink-500 mb-6 leading-tight">
+                  {aiAnalysis.persona}
+              </div>
+              <div className="text-zinc-400 text-sm font-bold uppercase tracking-wider mb-2">The Roast</div>
+              <p className="text-lg text-white font-medium leading-relaxed italic">
+                  "{aiAnalysis.roast}"
+              </p>
+          </div>
+      ) : (
+          <div className="flex flex-col items-center justify-center p-12 bg-black/20 rounded-2xl">
+              <Cpu className="w-12 h-12 text-purple-300 animate-spin mb-4" />
+              <p className="text-purple-200">Analyzing your purchase history...</p>
+              {!apiKey && <p className="text-xs text-red-400 mt-2">API Key missing!</p>}
+          </div>
+      )}
+    </Slide>,
+
+    // Slide 8: AI Unexpected Pairings (NEW!)
+    <Slide key="8" bgClass="bg-gradient-to-bl from-pink-900 to-purple-900" onNext={nextSlide} onPrev={prevSlide}>
+      <Scale className="w-16 h-16 text-pink-400 mx-auto mb-6" />
+      <h2 className="text-2xl font-black mb-8 text-white uppercase tracking-widest">Unexpected Pairing</h2>
+      
+      {pairingAnalysis ? (
+          <div className="animate-fadeIn w-full max-w-md flex flex-col gap-6">
+             <div className="flex items-center justify-between gap-4 relative">
+                <div className="bg-white/10 p-4 rounded-xl flex-1 border border-white/10 text-sm font-bold text-center h-24 flex items-center justify-center shadow-lg">
+                    {pairingAnalysis.item1}
+                </div>
+                <div className="bg-pink-500 text-white font-black rounded-full w-10 h-10 flex items-center justify-center absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 shadow-xl z-10 border-4 border-pink-900">VS</div>
+                <div className="bg-white/10 p-4 rounded-xl flex-1 border border-white/10 text-sm font-bold text-center h-24 flex items-center justify-center shadow-lg">
+                    {pairingAnalysis.item2}
+                </div>
+             </div>
+             <div className="bg-black/30 p-6 rounded-2xl border border-pink-500/30">
+                 <p className="text-xl text-pink-200 font-medium italic leading-relaxed">"{pairingAnalysis.comment}"</p>
+             </div>
+             <p className="text-xs text-zinc-500">Both purchased on the same day.</p>
+          </div>
+      ) : (
+          <div className="flex flex-col items-center justify-center p-12 bg-black/20 rounded-2xl">
+              <Sparkles className="w-12 h-12 text-pink-300 animate-spin mb-4" />
+              <p className="text-pink-200">Finding weird combos...</p>
+              {!apiKey && <p className="text-xs text-red-400 mt-2">API Key missing!</p>}
+          </div>
+      )}
+    </Slide>,
+
+    // Slide 9: Highs & Lows
+    <Slide key="9" bgClass="bg-zinc-900" onNext={nextSlide} onPrev={prevSlide}>
+      <div className="text-center w-full max-w-md mb-6">
+        <h2 className="text-3xl font-black text-white mb-2">The Highs & Lows</h2>
+        <p className="text-zinc-400 text-sm">Your most extreme purchases of 2025.</p>
+      </div>
+      
+      <div className="w-full max-w-md space-y-4">
+        {/* Most Expensive */}
+        <div className="bg-gradient-to-r from-yellow-600 to-orange-700 p-6 rounded-2xl text-white shadow-xl relative overflow-hidden group">
+            <div className="absolute right-[-20px] top-[-20px] bg-white/10 w-24 h-24 rounded-full blur-xl group-hover:bg-white/20 transition-all"></div>
+            <div className="flex justify-between items-start mb-2 relative z-10">
+                <div className="text-xs font-bold uppercase tracking-widest text-yellow-200">The Splurge</div>
+                <Award className="text-yellow-200" size={20} />
+            </div>
+            <div className="font-bold text-xl leading-tight mb-1 line-clamp-2">{stats.mostExpensive.title}</div>
+            <div className="text-3xl font-black">${stats.mostExpensive.price.toFixed(2)}</div>
+        </div>
+
+        {/* Cheapest */}
+        <div className="bg-gradient-to-r from-emerald-600 to-teal-700 p-6 rounded-2xl text-white shadow-xl relative overflow-hidden group">
+             <div className="absolute right-[-20px] top-[-20px] bg-white/10 w-24 h-24 rounded-full blur-xl group-hover:bg-white/20 transition-all"></div>
+            <div className="flex justify-between items-start mb-2 relative z-10">
+                <div className="text-xs font-bold uppercase tracking-widest text-emerald-200">The Steal</div>
+                <Tag className="text-emerald-200" size={20} />
+            </div>
+            <div className="font-bold text-xl leading-tight mb-1 line-clamp-2">{stats.cheapest.title}</div>
+            <div className="text-3xl font-black">${stats.cheapest.price.toFixed(2)}</div>
+        </div>
+      </div>
+    </Slide>,
+
+    // Slide 10: Summary Card & Comparison Trigger
+    <Slide key="10" bgClass="bg-black" onNext={nextSlide} onPrev={prevSlide} showNav={false}>
+      <div className="bg-zinc-900 p-8 rounded-3xl w-full max-w-sm border border-zinc-800 shadow-2xl mb-8">
+        <div className="flex justify-between items-start mb-6">
+          <div className="text-2xl font-black text-transparent bg-clip-text bg-gradient-to-r from-orange-400 to-yellow-500">
+            AMAZON<br/>WRAPPED
+          </div>
+          <div className="text-right text-zinc-500 text-sm font-mono">
+            2025
+          </div>
+        </div>
+        <div className="space-y-6">
+          <div className="flex justify-between items-end border-b border-zinc-800 pb-2">
+            <span className="text-zinc-400">Total Spent</span>
+            <span className="text-2xl font-bold text-white">${stats.totalSpent.toFixed(0)}</span>
+          </div>
+          <div className="flex justify-between items-end border-b border-zinc-800 pb-2">
+            <span className="text-zinc-400">Packages</span>
+            <span className="text-2xl font-bold text-white">{stats.totalOrders}</span>
+          </div>
+          <div className="flex justify-between items-end border-b border-zinc-800 pb-2">
+            <span className="text-zinc-400">Top Vibe</span>
+            <span className="text-2xl font-bold text-white">{stats.topCategory.name}</span>
+          </div>
+          {aiAnalysis && (
+             <div className="pt-2">
+                <span className="text-zinc-400 text-xs uppercase tracking-wider">Persona</span>
+                <div className="text-white font-medium truncate mt-1 text-yellow-400">{aiAnalysis.persona}</div>
+             </div>
+          )}
+        </div>
+         <div className="mt-8 pt-6 border-t border-zinc-800 flex items-center justify-between text-zinc-500 text-sm">
+          <span>amazon-wrapped-2025.com</span>
+          <Package size={16} />
+        </div>
+      </div>
+      
+      <button 
+        onClick={handleContribute}
+        disabled={hasSubmitted || isSubmitting}
+        className={`w-full max-w-sm py-4 rounded-xl font-bold flex items-center justify-center gap-2 mb-4 shadow-lg transition-all ${
+            hasSubmitted 
+            ? 'bg-zinc-800 text-zinc-500 cursor-not-allowed' 
+            : 'bg-blue-600 hover:bg-blue-500 text-white'
+        }`}
+      >
+        {isSubmitting ? <RefreshCw className="animate-spin" size={18} /> : hasSubmitted ? <Check size={18} /> : <Globe size={18} />}
+        {isSubmitting ? "Submitting..." : hasSubmitted ? "Submitted! Comparison Coming Soon" : "Join Community Data Pool (Beta)"}
+      </button>
+
+      <button onClick={() => { setData(null); setSlideIndex(0); setComparisonData(null); setAiAnalysis(null); setHasSubmitted(false); }} className="text-zinc-500 hover:text-white transition-colors flex items-center gap-2 text-sm">
+        <RefreshCw size={14} /> Start Over
+      </button>
+    </Slide>
+  ];
+
+  return (
+    <div className="fixed inset-0 bg-black text-white font-sans overflow-hidden">
+      <style>{`
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+        @keyframes slideUp { from { opacity: 0; transform: translateY(40px); } to { opacity: 1; transform: translateY(0); } }
+        @keyframes pulseGold { 
+          0%, 100% { transform: scale(1); filter: brightness(100%); } 
+          50% { transform: scale(1.05); filter: brightness(130%); text-shadow: 0 0 15px rgba(255, 153, 0, 0.4); } 
+        }
+        .animate-fadeIn { animation: fadeIn 0.8s ease-out forwards; }
+        .animate-pulse-gold { animation: pulseGold 2s infinite ease-in-out; }
+      `}</style>
+      
+      {/* Progress Bar */}
+      <ProgressBar current={slideIndex} total={slides.length} />
+
+      {/* Main Content Area */}
+      {slides[slideIndex]}
+
+    </div>
+  );
+}
+
+// Wrap the app in ErrorBoundary
+export default function AppWithErrorBoundary() {
+  return (
+    <ErrorBoundary>
+      <AmazonWrapped />
+    </ErrorBoundary>
+  );
+}

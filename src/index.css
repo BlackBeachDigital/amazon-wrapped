@@ -1,0 +1,20 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;900&display=swap');
+
+body {
+  margin: 0;
+  background-color: black;
+  font-family: 'Inter', sans-serif;
+  overflow: hidden; /* Prevent scrolling on the main body */
+}
+
+/* Custom Scrollbar for the Error Log */
+::-webkit-scrollbar {
+  width: 8px;
+}
+::-webkit-scrollbar-track {
+  background: #18181b; 
+}
+::-webkit-scrollbar-thumb {
+  background: #3f3f46; 
+  border-radius: 4px;
+}
